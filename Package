@@ -1,0 +1,1 @@
+sudo apt install -y python3-pygame python3-opengl python3-opencv python3-pip
