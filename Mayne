@@ -1,0 +1,259 @@
+import pygame
+from pygame.locals import *
+from OpenGL.GL import *
+from OpenGL.GLU import *
+
+import threading
+import time
+import math
+import cv2
+import numpy as np
+import RPi.GPIO as GPIO
+import smbus
+
+# =========================
+# SCREEN
+# =========================
+WIDTH, HEIGHT = 800, 480
+
+# =========================
+# GPIO
+# =========================
+TRIG_F, ECHO_F = 23, 24
+TRIG_R, ECHO_R = 27, 22
+HALL = 17
+BUZZER = 18
+
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(TRIG_F, GPIO.OUT)
+GPIO.setup(ECHO_F, GPIO.IN)
+GPIO.setup(TRIG_R, GPIO.OUT)
+GPIO.setup(ECHO_R, GPIO.IN)
+GPIO.setup(HALL, GPIO.IN)
+GPIO.setup(BUZZER, GPIO.OUT)
+
+# =========================
+# STATE
+# =========================
+state = {
+    "speed": 0,
+    "front": 200,
+    "rear": 200,
+    "pitch": 0,
+    "roll": 0,
+    "camera": None,
+    "running": True
+}
+
+# =========================
+# MPU6050
+# =========================
+bus = smbus.SMBus(1)
+MPU = 0x68
+
+def read(addr):
+    h = bus.read_byte_data(MPU, addr)
+    l = bus.read_byte_data(MPU, addr+1)
+    v = (h << 8) | l
+    return v - 65536 if v > 32768 else v
+
+class Smooth:
+    def __init__(self): self.v=0
+    def update(self,x): self.v += (x-self.v)*0.1; return self.v
+
+pitch_s = Smooth()
+roll_s = Smooth()
+
+def angles():
+    ax = read(0x3B)
+    ay = read(0x3D)
+    az = read(0x3F)
+
+    pitch = math.atan2(ax, math.sqrt(ay*ay+az*az))*57.3
+    roll  = math.atan2(ay, math.sqrt(ax*ax+az*az))*57.3
+
+    return pitch_s.update(pitch), roll_s.update(roll)
+
+# =========================
+# ULTRASONIC
+# =========================
+def dist(trig, echo):
+    GPIO.output(trig,1)
+    time.sleep(0.00001)
+    GPIO.output(trig,0)
+
+    start=time.time()
+    stop=time.time()
+
+    while GPIO.input(echo)==0:
+        start=time.time()
+    while GPIO.input(echo)==1:
+        stop=time.time()
+
+    return (stop-start)*17150
+
+# =========================
+# HALL SPEED
+# =========================
+rot=0
+def hall_cb(channel):
+    global rot
+    rot+=1
+
+GPIO.add_event_detect(HALL, GPIO.FALLING, hall_cb)
+
+# =========================
+# CAMERA
+# =========================
+def cam():
+    cap=cv2.VideoCapture(0)
+    while state["running"]:
+        ret,f=cap.read()
+        if ret:
+            state["camera"]=cv2.resize(f,(320,240))
+    cap.release()
+
+# =========================
+# SENSOR THREAD
+# =========================
+def sensors():
+    global rot
+    while state["running"]:
+        state["front"]=dist(TRIG_F,ECHO_F)
+        state["rear"]=dist(TRIG_R,ECHO_R)
+
+        state["speed"]=rot*2.3*2.237
+        rot=0
+
+        p,r=angles()
+        state["pitch"]=p
+        state["roll"]=r
+
+        time.sleep(0.1)
+
+# =========================
+# BUZZER
+# =========================
+def buzzer():
+    while state["running"]:
+        d=min(state["front"],state["rear"])
+
+        if d<25:
+            GPIO.output(BUZZER,1)
+        elif d<60:
+            GPIO.output(BUZZER,1)
+            time.sleep(0.1)
+            GPIO.output(BUZZER,0)
+        else:
+            GPIO.output(BUZZER,0)
+
+# =========================
+# PROCEDURAL 3D CAR MODEL
+# =========================
+def wheel(x,y,z):
+    glPushMatrix()
+    glTranslatef(x,y,z)
+    glColor3f(0.1,0.1,0.1)
+    glutSolidSphere(0.2,10,10)
+    glPopMatrix()
+
+def car_body():
+    glColor3f(0.0,0.7,1.0)
+
+    glBegin(GL_QUADS)
+
+    # base
+    glVertex3f(-1,-0.3,0.5)
+    glVertex3f(1,-0.3,0.5)
+    glVertex3f(1,-0.3,-0.5)
+    glVertex3f(-1,-0.3,-0.5)
+
+    # top
+    glVertex3f(-0.6,0.3,0.4)
+    glVertex3f(0.6,0.3,0.4)
+    glVertex3f(0.6,0.3,-0.4)
+    glVertex3f(-0.6,0.3,-0.4)
+
+    glEnd()
+
+def draw_car():
+    car_body()
+
+    # wheels
+    wheel(-0.8,-0.4,0.4)
+    wheel(0.8,-0.4,0.4)
+    wheel(-0.8,-0.4,-0.4)
+    wheel(0.8,-0.4,-0.4)
+
+# =========================
+# UI
+# =========================
+def radar(x,y,d):
+    pygame.draw.circle(screen,(0,255,255),(x,y),80,1)
+
+    c=(0,255,0)
+    if d<100:c=(255,255,0)
+    if d<60:c=(255,165,0)
+    if d<30:c=(255,0,0)
+
+    pygame.draw.circle(screen,c,(x,y-int(d/2)),10)
+
+def speed_ui():
+    font=pygame.font.SysFont("Arial",50)
+    screen.blit(font.render(f"{int(state['speed'])} MPH",1,(0,255,255)),(520,40))
+
+def camera_ui():
+    if state["camera"] is None:
+        return
+
+    f=cv2.cvtColor(state["camera"],cv2.COLOR_BGR2RGB)
+    f=np.rot90(f)
+    surf=pygame.surfarray.make_surface(f)
+    screen.blit(surf,(520,260))
+
+# =========================
+# INIT
+# =========================
+pygame.init()
+screen=pygame.display.set_mode((WIDTH,HEIGHT),DOUBLEBUF|OPENGL)
+gluPerspective(45,WIDTH/HEIGHT,0.1,50)
+glTranslatef(0,0,-6)
+
+threading.Thread(target=cam,daemon=True).start()
+threading.Thread(target=sensors,daemon=True).start()
+threading.Thread(target=buzzer,daemon=True).start()
+
+# =========================
+# MAIN LOOP
+# =========================
+running=True
+while running:
+
+    for e in pygame.event.get():
+        if e.type==QUIT:
+            running=False
+            state["running"]=False
+
+    glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT)
+
+    glPushMatrix()
+    glRotatef(state["pitch"]*0.5,1,0,0)
+    glRotatef(state["roll"]*0.5,0,1,0)
+
+    draw_car()
+
+    glPopMatrix()
+
+    pygame.display.flip()
+
+    screen.fill((10,10,15))
+
+    speed_ui()
+    radar(200,240,state["front"])
+    camera_ui()
+
+    pygame.display.update()
+    pygame.time.wait(16)
+
+GPIO.cleanup()
+pygame.quit()
